@@ -3,6 +3,7 @@ use core::fmt::Display;
 use core::mem;
 
 use crate::codec;
+use crate::codec::{Error, Type};
 use crate::cursor::{ReadCursor, WriteCursor};
 use crate::types::uuid::*;
 
@@ -323,6 +324,12 @@ pub enum AttRsp<'d> {
     },
     /// Write Response
     Write,
+
+    /// Find information response
+    FindInformation {
+        /// Iterator over the found handles
+        it: FindInformationIter<'d>
+    }
 }
 
 /// ATT Unsolicited PDU
@@ -408,6 +415,81 @@ impl<'d> ReadByTypeIter<'d> {
     }
 }
 
+/// Format field of the find information response
+#[derive(Clone, Debug)]
+pub enum FindInformationFormat {
+    /// 1 = response contains 16-bit UUIDs
+    Uuid16,
+    /// 2 = response contains 128-bit UUIDs
+    Uuid128
+}
+
+impl codec::Decode<'_> for FindInformationFormat {
+    fn decode(src: &'_ [u8]) -> Result<Self, Error> {
+        match src[0] {
+            1 => Ok(FindInformationFormat::Uuid16),
+            2 => Ok(FindInformationFormat::Uuid128),
+            _ => Err(Error::InvalidValue),
+        }
+    }
+}
+
+impl Type for FindInformationFormat {
+    fn size(&self) -> usize {
+        1
+    }
+}
+
+impl codec::Encode for FindInformationFormat {
+    fn encode(&self, dest: &mut [u8]) -> Result<(), Error> {
+        match self {
+            FindInformationFormat::Uuid16 => dest[0] = 1,
+            FindInformationFormat::Uuid128 => dest[0] = 2,
+        }
+        Ok(())
+    }
+}
+
+
+impl FindInformationFormat {
+    
+    /// Returns the size in bytes of the UUIDs contained in the response
+    pub fn uuid_size(&self) -> usize {
+        match self {
+            FindInformationFormat::Uuid16 => 2,
+            FindInformationFormat::Uuid128 => 16,
+        }
+    }
+}
+
+/// An Iterator-like type for iterating over the found handles
+#[cfg_attr(feature = "defmt", derive(defmt::Format))]
+#[derive(Clone, Debug)]
+pub struct FindInformationIter<'d> {
+    format: FindInformationFormat,
+    cursor: ReadCursor<'d>,
+}
+
+impl<'d> FindInformationIter<'d> {
+    /// Get the next pair of attribute handle and attribute data
+    #[allow(clippy::should_implement_trait)]
+    pub fn next(&mut self) -> Option<Result<(u16, Uuid), crate::Error>> {
+
+        if self.cursor.available() >= self.format.uuid_size() + size_of::<u16>() {
+            let res = (|| {
+                let handle: u16 = self.cursor.read()?;
+                let uuid = Uuid::try_from(self.cursor.slice(self.format.uuid_size())?)?;
+
+                Ok((handle, uuid))
+            })();
+
+            Some(res)
+        } else  {
+            None
+        }
+    }
+}
+
 impl<'d> AttServer<'d> {
     fn size(&self) -> usize {
         match self {
@@ -441,6 +523,7 @@ impl<'d> AttRsp<'d> {
             Self::Read { data } => data.len(),
             Self::ReadByType { it } => it.cursor.len(),
             Self::Write => 0,
+            Self::FindInformation { it } => { 1 + it.cursor.len() }
         }
     }
 
@@ -481,6 +564,15 @@ impl<'d> AttRsp<'d> {
             Self::Write => {
                 w.write(ATT_WRITE_RSP)?;
             }
+            Self::FindInformation { it } => {
+                w.write(ATT_FIND_INFORMATION_RSP)?;
+                w.write(it.format.clone())?;
+                let mut it = it.clone();
+                while let Some(Ok((handle, uuid))) = it.next() {
+                    w.write(handle)?;
+                    w.append(uuid.as_raw())?;
+                }
+            }
         }
         Ok(())
     }
@@ -511,6 +603,15 @@ impl<'d> AttRsp<'d> {
                 })
             }
             ATT_WRITE_RSP => Ok(Self::Write),
+            ATT_FIND_INFORMATION_RSP => {
+                let format = r.read()?;
+                Ok(Self::FindInformation {
+                    it: FindInformationIter {
+                        format,
+                        cursor: r,
+                    },
+                })
+            }
             _ => Err(codec::Error::InvalidValue),
         }
     }
@@ -606,6 +707,7 @@ impl<'d> AttReq<'d> {
             } => 4 + attribute_type.as_raw().len(),
             Self::Read { .. } => 2,
             Self::Write { handle, data } => 2 + data.len(),
+            Self::FindInformation { .. }  => 4,
             _ => unimplemented!(),
         }
     }
@@ -646,6 +748,11 @@ impl<'d> AttReq<'d> {
                 w.write(ATT_WRITE_REQ)?;
                 w.write(*handle)?;
                 w.append(data)?;
+            },
+            Self::FindInformation { start_handle, end_handle } => {
+                w.write(ATT_FIND_INFORMATION_REQ)?;
+                w.write(*start_handle)?;
+                w.write(*end_handle)?;
             }
             _ => unimplemented!(),
         }
